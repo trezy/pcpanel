@@ -6,7 +6,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 LIBASPL_DIR="$PROJECT_DIR/libASPL"
 LIBASPL_REPO="https://github.com/gavv/libASPL.git"
-LIBASPL_TAG="v3.1.0"  # Pin to specific version for reproducibility
+LIBASPL_TAG="v3.1.2"  # Pin to specific version for reproducibility
 
 echo "=== PC Panel Pro Setup ==="
 
