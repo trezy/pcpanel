@@ -1,0 +1,31 @@
+{
+  "name": "pcpanelpro",
+  "version": "0.1.0",
+  "description": "macOS controller for PC Panel Pro",
+  "main": "dist/main/index.js",
+  "scripts": {
+    "build": "tsc && npm run build:renderer && mkdir -p dist/main/assets && cp -r src/main/assets/* dist/main/assets/",
+    "build:renderer": "esbuild src/renderer/main.tsx --bundle --minify --outfile=dist/renderer/bundle.js --platform=browser --target=es2020 && cp src/renderer/index.html src/renderer/styles.css dist/renderer/",
+    "build:native": "cd native && node-gyp rebuild",
+    "start": "npm run build && electron .",
+    "rebuild": "electron-rebuild -f -w node-hid pcpanel_audio"
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "electron": "^28.0.0",
+    "electron-rebuild": "^3.2.9",
+    "esbuild": "^0.27.2",
+    "node-gyp": "^10.0.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "@types/react": "^19.2.10",
+    "@types/react-dom": "^19.2.3",
+    "node-addon-api": "^7.0.0",
+    "node-hid": "^3.0.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
+  }
+}

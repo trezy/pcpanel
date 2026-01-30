@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+native/node_modules/
+
+# Build outputs
+dist/
+build/
+native/build/
+driver/build/
+
+# Native addon artifacts
+*.node
+*.dylib
+*.a
+*.o
+
+# OS files
+.DS_Store
+.AppleDouble
+.LSOverride
+*.swp
+*~
+
+# IDE files
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
+
+# Logs
+*.log
+npm-debug.log*
