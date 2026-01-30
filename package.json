@@ -4,9 +4,12 @@
   "description": "macOS controller for PC Panel Pro",
   "main": "dist/main/index.js",
   "scripts": {
+    "setup": "bash scripts/setup.sh",
     "build": "tsc && npm run build:renderer && mkdir -p dist/main/assets && cp -r src/main/assets/* dist/main/assets/",
     "build:renderer": "esbuild src/renderer/main.tsx --bundle --minify --outfile=dist/renderer/bundle.js --platform=browser --target=es2020 && cp src/renderer/index.html src/renderer/styles.css dist/renderer/",
     "build:native": "cd native && node-gyp rebuild",
+    "build:driver": "bash scripts/build-driver.sh",
+    "install:driver": "bash scripts/install-driver.sh",
     "start": "npm run build && electron .",
     "rebuild": "electron-rebuild -f -w node-hid pcpanel_audio"
   },
