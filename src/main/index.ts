@@ -1,7 +1,8 @@
-import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage } from 'electron';
+import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, dialog } from 'electron';
 import * as path from 'path';
 import { scanForDevices, PCPanelConnection, DeviceState, DeviceEvent } from './hid';
 import { audioPassthrough } from './audio/passthrough';
+import { isDriverInstalled, promptAndInstallDriver, showDriverNotInstalledWarning, isFirstLaunch, markFirstLaunchComplete } from './driver/installer';
 
 let mainWindow: BrowserWindow | null = null;
 let connection: PCPanelConnection | null = null;
@@ -141,12 +142,24 @@ async function connectToDevice(): Promise<void> {
   const devices = await scanForDevices();
 
   if (devices.length === 0) {
-    sendToRenderer('device-status', { connected: false, message: 'No PC Panel Pro found' });
+    sendToRenderer('device-status', { connected: false, message: 'No PC Panel found' });
     return;
   }
 
   const device = devices[0];
-  log('Found PC Panel Pro:', device);
+
+  // Log device info
+  if (device.isKnown) {
+    log(`Found ${device.profile.name}:`, device.path);
+  } else if (device.isPotentialPCPanel) {
+    log(`Found potential PCPanel device (unknown model):`, device);
+    // Notify user about unknown device
+    sendToRenderer('toast', {
+      type: 'info',
+      message: `Unknown PCPanel detected (VID:${device.vendorId.toString(16)} PID:${device.productId.toString(16)}). Please report this!`,
+      duration: 5000
+    });
+  }
 
   if (connection) {
     connection.disconnect();
@@ -155,8 +168,8 @@ async function connectToDevice(): Promise<void> {
   connection = new PCPanelConnection();
 
   connection.on('connected', () => {
-    log('Connected to PC Panel Pro');
-    sendToRenderer('device-status', { connected: true, message: 'Connected' });
+    log(`Connected to ${device.profile.name}`);
+    sendToRenderer('device-status', { connected: true, message: `Connected to ${device.profile.name}` });
 
     // Request current device state to initialize volumes
     setTimeout(() => {
@@ -168,7 +181,7 @@ async function connectToDevice(): Promise<void> {
   });
 
   connection.on('disconnected', () => {
-    log('Disconnected from PC Panel Pro');
+    log(`Disconnected from ${device.profile.name}`);
     sendToRenderer('device-status', { connected: false, message: 'Disconnected' });
   });
 
@@ -214,9 +227,67 @@ function startDeviceScanning(): void {
   }, 3000);
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  const firstLaunch = isFirstLaunch();
+
   createTray();
   createWindow();
+
+  // Check driver status after window is created so we can send toasts
+  // Wait a moment for the renderer to be ready
+  setTimeout(async () => {
+    const driverInstalled = isDriverInstalled();
+
+    if (firstLaunch) {
+      // First launch: show full dialog prompts
+      log('First launch - checking driver status...');
+      if (!driverInstalled) {
+        log('Audio driver not installed, prompting user...');
+        const installed = await promptAndInstallDriver();
+        if (!installed) {
+          await showDriverNotInstalledWarning();
+        }
+      }
+      markFirstLaunchComplete();
+    } else {
+      // Subsequent launches: use toast notifications
+      if (driverInstalled) {
+        sendToRenderer('toast', {
+          type: 'success',
+          message: 'Audio driver ready',
+          duration: 2000
+        });
+        log('Driver check passed');
+      } else {
+        // Driver is missing - show toast first, then prompt to reinstall
+        sendToRenderer('toast', {
+          type: 'warning',
+          message: 'Audio driver not found - prompting for reinstall...',
+          duration: 3000
+        });
+        log('Audio driver missing, prompting for reinstall...');
+
+        // Wait for toast to show, then prompt
+        setTimeout(async () => {
+          const installed = await promptAndInstallDriver();
+          if (installed) {
+            sendToRenderer('toast', {
+              type: 'success',
+              message: 'Audio driver installed successfully',
+              duration: 3000
+            });
+          } else {
+            sendToRenderer('toast', {
+              type: 'error',
+              message: 'Per-app volume control unavailable without driver',
+              duration: 5000
+            });
+          }
+        }, 500);
+      }
+    }
+  }, 500);
+
   startDeviceScanning();
 
   // Start audio passthrough for available PCPanel devices

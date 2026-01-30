@@ -1,9 +1,12 @@
 // PC Panel Pro - Audio Passthrough Native Addon
 // Routes audio from virtual PCPanel devices to real output device
+// Direct AUHAL connection for low-latency passthrough
 
 #include <napi.h>
 #include <CoreAudio/CoreAudio.h>
 #include <AudioToolbox/AudioToolbox.h>
+#include <AudioUnit/AudioUnit.h>
+#import <Foundation/Foundation.h>
 #include <vector>
 #include <mutex>
 #include <atomic>
@@ -11,75 +14,56 @@
 #include <chrono>
 #include <cmath>
 
-// Ring buffer for audio passthrough
-class RingBuffer {
-public:
-    RingBuffer(size_t sizeInFrames, UInt32 /* channelCount */, UInt32 bytesPerFrame)
-        : capacity_(sizeInFrames * bytesPerFrame)
-        , buffer_(capacity_)
-        , writePos_(0)
-        , readPos_(0)
-    {}
+// Logging macro that uses NSLog (appears in Console.app)
+#define PCPANEL_LOG(fmt, ...) NSLog(@"[PCPanel Audio] " fmt, ##__VA_ARGS__)
 
-    void write(const void* data, size_t bytes) {
-        const uint8_t* src = static_cast<const uint8_t*>(data);
-        size_t toWrite = bytes;
+// Helper: Get device's nominal sample rate
+static Float64 getDeviceSampleRate(AudioDeviceID deviceID) {
+    AudioObjectPropertyAddress propAddr = {
+        kAudioDevicePropertyNominalSampleRate,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
 
-        while (toWrite > 0) {
-            size_t writeIdx = writePos_.load() % capacity_;
-            size_t available = capacity_ - writeIdx;
-            size_t chunk = std::min(toWrite, available);
+    Float64 sampleRate = 0;
+    UInt32 propSize = sizeof(sampleRate);
+    OSStatus status = AudioObjectGetPropertyData(deviceID, &propAddr, 0, nullptr, &propSize, &sampleRate);
 
-            memcpy(buffer_.data() + writeIdx, src, chunk);
+    if (status != noErr || sampleRate == 0) {
+        return 48000.0;  // Fallback
+    }
+    return sampleRate;
+}
 
-            src += chunk;
-            toWrite -= chunk;
-            writePos_.fetch_add(chunk);
-        }
+// Helper: Set device's sample rate
+static bool setDeviceSampleRate(AudioDeviceID deviceID, Float64 sampleRate) {
+    AudioObjectPropertyAddress propAddr = {
+        kAudioDevicePropertyNominalSampleRate,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+
+    // Check if writable
+    Boolean isSettable = false;
+    OSStatus status = AudioObjectIsPropertySettable(deviceID, &propAddr, &isSettable);
+    if (status != noErr || !isSettable) {
+        return false;
     }
 
-    size_t read(void* data, size_t bytes) {
-        uint8_t* dst = static_cast<uint8_t*>(data);
-        size_t available = writePos_.load() - readPos_.load();
-        size_t toRead = std::min(bytes, available);
-        size_t totalRead = 0;
+    status = AudioObjectSetPropertyData(deviceID, &propAddr, 0, nullptr, sizeof(sampleRate), &sampleRate);
+    return status == noErr;
+}
 
-        while (totalRead < toRead) {
-            size_t readIdx = readPos_.load() % capacity_;
-            size_t availableInBuffer = capacity_ - readIdx;
-            size_t chunk = std::min(toRead - totalRead, availableInBuffer);
-
-            memcpy(dst + totalRead, buffer_.data() + readIdx, chunk);
-
-            totalRead += chunk;
-            readPos_.fetch_add(chunk);
-        }
-
-        // Fill remaining with silence
-        if (totalRead < bytes) {
-            memset(dst + totalRead, 0, bytes - totalRead);
-        }
-
-        return totalRead;
-    }
-
-private:
-    size_t capacity_;
-    std::vector<uint8_t> buffer_;
-    std::atomic<size_t> writePos_;
-    std::atomic<size_t> readPos_;
-};
-
-// Audio passthrough manager
+// Audio passthrough using direct AUHAL connection
 class AudioPassthrough {
 public:
     AudioPassthrough()
         : inputDevice_(kAudioObjectUnknown)
         , outputDevice_(kAudioObjectUnknown)
-        , inputProcID_(nullptr)
-        , outputProcID_(nullptr)
+        , auGraph_(nullptr)
+        , inputUnit_(nullptr)
+        , outputUnit_(nullptr)
         , running_(false)
-        , ringBuffer_(nullptr)
         , volume_(1.0f)
         , lastActivityTime_(0)
     {}
@@ -96,106 +80,219 @@ public:
         inputDevice_ = inputDevice;
         outputDevice_ = outputDevice;
 
-        // Get the output device's sample rate first - this is the rate we need to match
-        AudioObjectPropertyAddress propAddr = {
-            kAudioDevicePropertyNominalSampleRate,
-            kAudioObjectPropertyScopeGlobal,
-            kAudioObjectPropertyElementMain
-        };
+        // Get sample rates from both devices
+        Float64 inputSampleRate = getDeviceSampleRate(inputDevice_);
+        Float64 outputSampleRate = getDeviceSampleRate(outputDevice_);
 
-        Float64 outputSampleRate = 0;
-        UInt32 propSize = sizeof(outputSampleRate);
-        OSStatus status = AudioObjectGetPropertyData(outputDevice_, &propAddr, 0, nullptr,
-                                                      &propSize, &outputSampleRate);
-        if (status != noErr || outputSampleRate == 0) {
-            outputSampleRate = 48000; // Default fallback
-        }
+        PCPANEL_LOG(@"Input device sample rate: %.0f Hz", inputSampleRate);
+        PCPANEL_LOG(@"Output device sample rate: %.0f Hz", outputSampleRate);
 
-        // Get virtual device's current sample rate
-        Float64 inputSampleRate = 0;
-        propSize = sizeof(inputSampleRate);
-        status = AudioObjectGetPropertyData(inputDevice_, &propAddr, 0, nullptr,
-                                            &propSize, &inputSampleRate);
-
-        // Set the virtual device's sample rate to match the output device
+        // Try to match sample rates if they differ
         if (inputSampleRate != outputSampleRate) {
-            Float64 newRate = outputSampleRate;
-            propSize = sizeof(newRate);
-            AudioObjectSetPropertyData(inputDevice_, &propAddr, 0, nullptr,
-                                       propSize, &newRate);
-        }
-
-        // Get stream format from the INPUT scope of our virtual device
-        AudioStreamBasicDescription inputFormat;
-        propSize = sizeof(inputFormat);
-        propAddr.mSelector = kAudioDevicePropertyStreamFormat;
-        propAddr.mScope = kAudioDevicePropertyScopeInput;
-
-        status = AudioObjectGetPropertyData(inputDevice_, &propAddr, 0, nullptr,
-                                            &propSize, &inputFormat);
-        if (status != noErr) {
-            // Fallback: try output scope if input scope fails
-            propAddr.mScope = kAudioDevicePropertyScopeOutput;
-            status = AudioObjectGetPropertyData(inputDevice_, &propAddr, 0, nullptr,
-                                                &propSize, &inputFormat);
-            if (status != noErr) {
-                return false;
+            PCPANEL_LOG(@"Sample rate mismatch, attempting to set input device to %.0f Hz", outputSampleRate);
+            if (setDeviceSampleRate(inputDevice_, outputSampleRate)) {
+                inputSampleRate = outputSampleRate;
+                PCPANEL_LOG(@"Successfully set input device sample rate to %.0f Hz", outputSampleRate);
+            } else {
+                PCPANEL_LOG(@"Warning: Could not set input sample rate - audio may have pitch issues");
             }
         }
 
-        // Create ring buffer (2 seconds of audio for more headroom)
-        UInt32 bytesPerFrame = inputFormat.mBytesPerFrame;
-        if (bytesPerFrame == 0) {
-            bytesPerFrame = inputFormat.mChannelsPerFrame * sizeof(Float32);
-        }
-
-        ringBuffer_ = std::make_unique<RingBuffer>(
-            static_cast<size_t>(outputSampleRate * 2),  // 2 seconds buffer
-            inputFormat.mChannelsPerFrame,
-            bytesPerFrame
-        );
-
-        format_ = inputFormat;
-
-        // Create input IOProc (reads from virtual device)
-        status = AudioDeviceCreateIOProcID(inputDevice_, InputIOProc, this, &inputProcID_);
+        // Create AUGraph
+        OSStatus status = NewAUGraph(&auGraph_);
         if (status != noErr) {
-            fprintf(stderr, "Failed to create input IOProc (error %d)\n", status);
+            PCPANEL_LOG(@"Failed to create AUGraph: %d", (int)status);
             return false;
         }
 
-        // Create output IOProc (writes to real device)
-        status = AudioDeviceCreateIOProcID(outputDevice_, OutputIOProc, this, &outputProcID_);
+        // Add input (AUHAL) node for virtual device
+        AudioComponentDescription inputDesc = {
+            kAudioUnitType_Output,
+            kAudioUnitSubType_HALOutput,
+            kAudioUnitManufacturer_Apple,
+            0, 0
+        };
+        AUNode inputNode;
+        status = AUGraphAddNode(auGraph_, &inputDesc, &inputNode);
         if (status != noErr) {
-            AudioDeviceDestroyIOProcID(inputDevice_, inputProcID_);
-            inputProcID_ = nullptr;
-            fprintf(stderr, "Failed to create output IOProc (error %d)\n", status);
+            PCPANEL_LOG(@"Failed to add input node: %d", (int)status);
+            DisposeAUGraph(auGraph_);
+            auGraph_ = nullptr;
             return false;
         }
 
-        // Start both IOProcs
-        status = AudioDeviceStart(inputDevice_, inputProcID_);
+        // Add output (AUHAL) node for real device
+        AudioComponentDescription outputDesc = {
+            kAudioUnitType_Output,
+            kAudioUnitSubType_HALOutput,
+            kAudioUnitManufacturer_Apple,
+            0, 0
+        };
+        AUNode outputNode;
+        status = AUGraphAddNode(auGraph_, &outputDesc, &outputNode);
         if (status != noErr) {
-            AudioDeviceDestroyIOProcID(inputDevice_, inputProcID_);
-            AudioDeviceDestroyIOProcID(outputDevice_, outputProcID_);
-            inputProcID_ = nullptr;
-            outputProcID_ = nullptr;
-            fprintf(stderr, "Failed to start input IOProc (error %d)\n", status);
+            PCPANEL_LOG(@"Failed to add output node: %d", (int)status);
+            DisposeAUGraph(auGraph_);
+            auGraph_ = nullptr;
             return false;
         }
 
-        status = AudioDeviceStart(outputDevice_, outputProcID_);
+        // Open the graph to get AudioUnit instances
+        status = AUGraphOpen(auGraph_);
         if (status != noErr) {
-            AudioDeviceStop(inputDevice_, inputProcID_);
-            AudioDeviceDestroyIOProcID(inputDevice_, inputProcID_);
-            AudioDeviceDestroyIOProcID(outputDevice_, outputProcID_);
-            inputProcID_ = nullptr;
-            outputProcID_ = nullptr;
-            fprintf(stderr, "Failed to start output IOProc (error %d)\n", status);
+            PCPANEL_LOG(@"Failed to open AUGraph: %d", (int)status);
+            DisposeAUGraph(auGraph_);
+            auGraph_ = nullptr;
+            return false;
+        }
+
+        // Get the AudioUnit instances
+        status = AUGraphNodeInfo(auGraph_, inputNode, nullptr, &inputUnit_);
+        if (status != noErr) {
+            PCPANEL_LOG(@"Failed to get input unit: %d", (int)status);
+            DisposeAUGraph(auGraph_);
+            auGraph_ = nullptr;
+            return false;
+        }
+
+        status = AUGraphNodeInfo(auGraph_, outputNode, nullptr, &outputUnit_);
+        if (status != noErr) {
+            PCPANEL_LOG(@"Failed to get output unit: %d", (int)status);
+            DisposeAUGraph(auGraph_);
+            auGraph_ = nullptr;
+            return false;
+        }
+
+        // Configure input unit (from virtual device)
+        // Enable input on the input unit
+        UInt32 enableIO = 1;
+        status = AudioUnitSetProperty(inputUnit_,
+                                       kAudioOutputUnitProperty_EnableIO,
+                                       kAudioUnitScope_Input,
+                                       1,  // input element
+                                       &enableIO,
+                                       sizeof(enableIO));
+        if (status != noErr) {
+            PCPANEL_LOG(@"Failed to enable input IO: %d", (int)status);
+        }
+
+        // Disable output on input unit (we're only using it for input)
+        enableIO = 0;
+        status = AudioUnitSetProperty(inputUnit_,
+                                       kAudioOutputUnitProperty_EnableIO,
+                                       kAudioUnitScope_Output,
+                                       0,  // output element
+                                       &enableIO,
+                                       sizeof(enableIO));
+        if (status != noErr) {
+            PCPANEL_LOG(@"Failed to disable output IO on input unit: %d", (int)status);
+        }
+
+        // Set the input device
+        status = AudioUnitSetProperty(inputUnit_,
+                                       kAudioOutputUnitProperty_CurrentDevice,
+                                       kAudioUnitScope_Global,
+                                       0,
+                                       &inputDevice_,
+                                       sizeof(inputDevice_));
+        if (status != noErr) {
+            PCPANEL_LOG(@"Failed to set input device: %d", (int)status);
+            DisposeAUGraph(auGraph_);
+            auGraph_ = nullptr;
+            return false;
+        }
+
+        // Set the output device
+        status = AudioUnitSetProperty(outputUnit_,
+                                       kAudioOutputUnitProperty_CurrentDevice,
+                                       kAudioUnitScope_Global,
+                                       0,
+                                       &outputDevice_,
+                                       sizeof(outputDevice_));
+        if (status != noErr) {
+            PCPANEL_LOG(@"Failed to set output device: %d", (int)status);
+            DisposeAUGraph(auGraph_);
+            auGraph_ = nullptr;
+            return false;
+        }
+
+        // Re-read sample rate after setting device (may have changed)
+        Float64 sampleRate = getDeviceSampleRate(inputDevice_);
+
+        // Create stream format (use same format for both - 48kHz stereo Float32)
+        AudioStreamBasicDescription streamFormat;
+        memset(&streamFormat, 0, sizeof(streamFormat));
+        streamFormat.mSampleRate = sampleRate;
+        streamFormat.mFormatID = kAudioFormatLinearPCM;
+        streamFormat.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved;
+        streamFormat.mBitsPerChannel = 32;
+        streamFormat.mChannelsPerFrame = 2;
+        streamFormat.mFramesPerPacket = 1;
+        streamFormat.mBytesPerFrame = 4;
+        streamFormat.mBytesPerPacket = 4;
+
+        // Store format for reference
+        format_ = streamFormat;
+
+        // Set stream format on the output of the input unit (what we read from input)
+        status = AudioUnitSetProperty(inputUnit_,
+                                       kAudioUnitProperty_StreamFormat,
+                                       kAudioUnitScope_Output,
+                                       1,  // input element
+                                       &streamFormat,
+                                       sizeof(streamFormat));
+        if (status != noErr) {
+            PCPANEL_LOG(@"Failed to set input unit output format: %d", (int)status);
+        }
+
+        // Set the format on the input of the output unit
+        status = AudioUnitSetProperty(outputUnit_,
+                                       kAudioUnitProperty_StreamFormat,
+                                       kAudioUnitScope_Input,
+                                       0,  // output element
+                                       &streamFormat,
+                                       sizeof(streamFormat));
+        if (status != noErr) {
+            PCPANEL_LOG(@"Failed to set output unit input format: %d", (int)status);
+        }
+
+        // Set up render callback on output unit to pull directly from input
+        AURenderCallbackStruct outputCallback;
+        outputCallback.inputProc = OutputRenderCallback;
+        outputCallback.inputProcRefCon = this;
+        status = AudioUnitSetProperty(outputUnit_,
+                                       kAudioUnitProperty_SetRenderCallback,
+                                       kAudioUnitScope_Input,
+                                       0,  // output element
+                                       &outputCallback,
+                                       sizeof(outputCallback));
+        if (status != noErr) {
+            PCPANEL_LOG(@"Failed to set output render callback: %d", (int)status);
+            DisposeAUGraph(auGraph_);
+            auGraph_ = nullptr;
+            return false;
+        }
+
+        // Initialize the graph
+        status = AUGraphInitialize(auGraph_);
+        if (status != noErr) {
+            PCPANEL_LOG(@"Failed to initialize AUGraph: %d", (int)status);
+            DisposeAUGraph(auGraph_);
+            auGraph_ = nullptr;
+            return false;
+        }
+
+        // Start the graph
+        status = AUGraphStart(auGraph_);
+        if (status != noErr) {
+            PCPANEL_LOG(@"Failed to start AUGraph: %d", (int)status);
+            DisposeAUGraph(auGraph_);
+            auGraph_ = nullptr;
             return false;
         }
 
         running_ = true;
+        PCPANEL_LOG(@"Audio passthrough started at %.0f Hz", sampleRate);
         return true;
     }
 
@@ -206,19 +303,18 @@ public:
 
         running_ = false;
 
-        if (inputProcID_) {
-            AudioDeviceStop(inputDevice_, inputProcID_);
-            AudioDeviceDestroyIOProcID(inputDevice_, inputProcID_);
-            inputProcID_ = nullptr;
+        if (auGraph_) {
+            AUGraphStop(auGraph_);
+            AUGraphUninitialize(auGraph_);
+            AUGraphClose(auGraph_);
+            DisposeAUGraph(auGraph_);
+            auGraph_ = nullptr;
         }
 
-        if (outputProcID_) {
-            AudioDeviceStop(outputDevice_, outputProcID_);
-            AudioDeviceDestroyIOProcID(outputDevice_, outputProcID_);
-            outputProcID_ = nullptr;
-        }
+        inputUnit_ = nullptr;
+        outputUnit_ = nullptr;
 
-        ringBuffer_.reset();
+        PCPANEL_LOG(@"Audio passthrough stopped");
     }
 
     bool isRunning() const {
@@ -234,75 +330,60 @@ public:
     }
 
     bool hasAudioActivity() const {
-        // Consider audio active if we've seen non-silent audio in the last 500ms
         auto now = std::chrono::steady_clock::now().time_since_epoch().count();
         auto elapsed = now - lastActivityTime_.load();
-        // 500ms in nanoseconds
-        return elapsed < 500000000LL;
+        return elapsed < 500000000LL;  // 500ms in nanoseconds
     }
 
 private:
-    static OSStatus InputIOProc(AudioObjectID /* device */,
-                                 const AudioTimeStamp* /* now */,
-                                 const AudioBufferList* inputData,
-                                 const AudioTimeStamp* /* inputTime */,
-                                 AudioBufferList* /* outputData */,
-                                 const AudioTimeStamp* /* outputTime */,
-                                 void* clientData) {
-        auto* self = static_cast<AudioPassthrough*>(clientData);
+    // This callback provides audio to the output unit (pulls directly from input)
+    static OSStatus OutputRenderCallback(void* inRefCon,
+                                          AudioUnitRenderActionFlags* ioActionFlags,
+                                          const AudioTimeStamp* inTimeStamp,
+                                          UInt32 inBusNumber,
+                                          UInt32 inNumberFrames,
+                                          AudioBufferList* ioData) {
+        (void)inBusNumber;
+        auto* self = static_cast<AudioPassthrough*>(inRefCon);
 
-        // Read from the INPUT side of the virtual device
-        // The driver's loopback puts output audio into the input stream
-        if (inputData && inputData->mNumberBuffers > 0) {
-            for (UInt32 i = 0; i < inputData->mNumberBuffers; i++) {
-                const AudioBuffer& buf = inputData->mBuffers[i];
-                if (buf.mData && buf.mDataByteSize > 0) {
-                    self->ringBuffer_->write(buf.mData, buf.mDataByteSize);
+        // Render directly from the input unit
+        OSStatus status = AudioUnitRender(self->inputUnit_,
+                                           ioActionFlags,
+                                           inTimeStamp,
+                                           1,  // input element
+                                           inNumberFrames,
+                                           ioData);
 
-                    // Check for non-silent audio (any sample above -60dB threshold)
-                    const Float32* samples = static_cast<const Float32*>(buf.mData);
-                    UInt32 sampleCount = buf.mDataByteSize / sizeof(Float32);
-                    for (UInt32 j = 0; j < sampleCount; j++) {
-                        if (std::fabs(samples[j]) > 0.001f) {
-                            self->lastActivityTime_.store(
-                                std::chrono::steady_clock::now().time_since_epoch().count()
-                            );
-                            break;
-                        }
-                    }
+        if (status != noErr) {
+            // Fill with silence on error
+            for (UInt32 i = 0; i < ioData->mNumberBuffers; i++) {
+                memset(ioData->mBuffers[i].mData, 0, ioData->mBuffers[i].mDataByteSize);
+            }
+            return noErr;
+        }
+
+        // Apply volume and check for activity
+        float volume = self->volume_;
+        bool foundActivity = false;
+
+        for (UInt32 buf = 0; buf < ioData->mNumberBuffers; buf++) {
+            Float32* samples = (Float32*)ioData->mBuffers[buf].mData;
+            UInt32 sampleCount = ioData->mBuffers[buf].mDataByteSize / sizeof(Float32);
+
+            for (UInt32 i = 0; i < sampleCount; i++) {
+                // Check for activity
+                if (!foundActivity && std::fabs(samples[i]) > 0.001f) {
+                    foundActivity = true;
                 }
+                // Apply volume
+                samples[i] *= volume;
             }
         }
 
-        return noErr;
-    }
-
-    static OSStatus OutputIOProc(AudioObjectID /* device */,
-                                  const AudioTimeStamp* /* now */,
-                                  const AudioBufferList* /* inputData */,
-                                  const AudioTimeStamp* /* inputTime */,
-                                  AudioBufferList* outputData,
-                                  const AudioTimeStamp* /* outputTime */,
-                                  void* clientData) {
-        auto* self = static_cast<AudioPassthrough*>(clientData);
-
-        if (outputData && outputData->mNumberBuffers > 0) {
-            for (UInt32 i = 0; i < outputData->mNumberBuffers; i++) {
-                AudioBuffer& buf = outputData->mBuffers[i];
-                if (buf.mData && buf.mDataByteSize > 0) {
-                    self->ringBuffer_->read(buf.mData, buf.mDataByteSize);
-
-                    // Apply volume
-                    float volume = self->volume_;
-                    if (volume < 1.0f) {
-                        Float32* samples = static_cast<Float32*>(buf.mData);
-                        UInt32 sampleCount = buf.mDataByteSize / sizeof(Float32);
-                        for (UInt32 j = 0; j < sampleCount; j++) {
-                            samples[j] *= volume;
-                        }
-                    }
-                }
-            }
+        if (foundActivity) {
+            self->lastActivityTime_.store(
+                std::chrono::steady_clock::now().time_since_epoch().count()
+            );
         }
 
         return noErr;
@@ -310,11 +391,11 @@ private:
 
     AudioDeviceID inputDevice_;
     AudioDeviceID outputDevice_;
-    AudioDeviceIOProcID inputProcID_;
-    AudioDeviceIOProcID outputProcID_;
-    std::atomic<bool> running_;
-    std::unique_ptr<RingBuffer> ringBuffer_;
+    AUGraph auGraph_;
+    AudioUnit inputUnit_;
+    AudioUnit outputUnit_;
     AudioStreamBasicDescription format_;
+    std::atomic<bool> running_;
     std::atomic<float> volume_;
     std::atomic<int64_t> lastActivityTime_;
 };
@@ -402,11 +483,6 @@ AudioDeviceID getDefaultOutputDevice() {
     return deviceID;
 }
 
-// NOTE: App name detection for audio clients is not currently implemented.
-// CoreAudio's kAudioDevicePropertyClientList and kAudioHardwarePropertyProcessObjectList
-// are not accessible from HAL plugin context. A future phase will implement this
-// using a privileged helper daemon with access to private AudioHardwareService APIs.
-
 // N-API wrapper functions
 Napi::Value ListAudioDevices(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
@@ -486,6 +562,8 @@ Napi::Value StartPassthrough(const Napi::CallbackInfo& info) {
 
     std::string inputName = info[0].As<Napi::String>().Utf8Value();
 
+    PCPANEL_LOG(@"Starting passthrough for device: %s", inputName.c_str());
+
     // Find device that has INPUT streams (for reading loopback audio)
     AudioDeviceID inputDevice = findDeviceByName(inputName, false);  // false = look for input capability
     if (inputDevice == kAudioObjectUnknown) {
@@ -493,18 +571,21 @@ Napi::Value StartPassthrough(const Napi::CallbackInfo& info) {
         inputDevice = findDeviceByName(inputName, true);
     }
     if (inputDevice == kAudioObjectUnknown) {
+        PCPANEL_LOG(@"Input device not found: %s", inputName.c_str());
         Napi::Error::New(env, "Input device not found: " + inputName).ThrowAsJavaScriptException();
         return env.Null();
     }
 
     AudioDeviceID outputDevice = getDefaultOutputDevice();
     if (outputDevice == kAudioObjectUnknown) {
+        PCPANEL_LOG(@"No default output device");
         Napi::Error::New(env, "No default output device").ThrowAsJavaScriptException();
         return env.Null();
     }
 
     // Don't passthrough to itself
     if (inputDevice == outputDevice) {
+        PCPANEL_LOG(@"Skipping passthrough - input and output are same device");
         return Napi::Boolean::New(env, true);
     }
 
@@ -512,6 +593,7 @@ Napi::Value StartPassthrough(const Napi::CallbackInfo& info) {
 
     auto passthrough = std::make_unique<AudioPassthrough>();
     if (!passthrough->start(inputDevice, outputDevice)) {
+        PCPANEL_LOG(@"Failed to start passthrough for: %s", inputName.c_str());
         Napi::Error::New(env, "Failed to start passthrough").ThrowAsJavaScriptException();
         return env.Null();
     }
@@ -548,6 +630,8 @@ Napi::Value StopPassthrough(const Napi::CallbackInfo& info) {
 
 Napi::Value StopAllPassthrough(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
+
+    PCPANEL_LOG(@"Stopping all passthroughs");
 
     std::lock_guard<std::mutex> lock(g_mutex);
 

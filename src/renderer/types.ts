@@ -29,12 +29,19 @@ export interface StateResponseEvent {
 
 export type DeviceEvent = KnobChangeEvent | ButtonChangeEvent | StateResponseEvent;
 
+export interface ToastData {
+  type: 'success' | 'warning' | 'error' | 'info';
+  message: string;
+  duration?: number;
+}
+
 export interface PCPanelAPI {
   onDeviceStatus: (callback: (status: { connected: boolean; message: string }) => void) => void;
   onDeviceEvent: (callback: (event: DeviceEvent) => void) => void;
   onDeviceState: (callback: (state: DeviceState) => void) => void;
   onOutputDevice: (callback: (device: { name: string }) => void) => void;
   onChannelActivity: (callback: (activityInfo: Record<number, ChannelActivityInfo>) => void) => void;
+  onToast: (callback: (toast: ToastData) => void) => void;
   getDeviceState: () => Promise<DeviceState>;
   getOutputDevice: () => Promise<{ name: string } | null>;
   getChannelActivity: () => Promise<Record<number, ChannelActivityInfo>>;

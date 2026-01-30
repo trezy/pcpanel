@@ -75,6 +75,8 @@ public:
     void clear() {
         writePos_.store(0, std::memory_order_relaxed);
         readPos_.store(0, std::memory_order_relaxed);
+        // Zero out buffer to prevent stale audio playback
+        std::memset(buffer_.data(), 0, buffer_.size());
     }
 
 private:
@@ -137,7 +139,8 @@ public:
     }
 
     void OnStopIO() override {
-        // Nothing to clean up
+        // Clear buffer to prevent stale audio from being played back
+        buffer_->clear();
     }
 
 private:
@@ -166,12 +169,13 @@ public:
         controlHandler_ = controlHandler;
     }
 
-    // Return list of supported sample rates - support both 44100 and 48000
+    // Return list of supported sample rates - support both 48000 and 44100
+    // 48000 is listed first as preferred (modern macOS standard)
     std::vector<AudioValueRange> GetAvailableSampleRates() const override
     {
         return {
-            AudioValueRange{44100.0, 44100.0},
-            AudioValueRange{48000.0, 48000.0}
+            AudioValueRange{48000.0, 48000.0},
+            AudioValueRange{44100.0, 44100.0}
         };
     }
 
@@ -290,8 +294,9 @@ extern "C" void* PCPanelDriverEntry(CFAllocatorRef allocator, CFUUIDRef typeUUID
     auto plugin = std::make_shared<aspl::Plugin>(context);
 
     // Create stream format (Float32 stereo for good quality)
+    // Use 48000 Hz as modern macOS standard (matches most output devices)
     AudioStreamBasicDescription streamFormat = {
-        .mSampleRate = 44100,
+        .mSampleRate = 48000,
         .mFormatID = kAudioFormatLinearPCM,
         .mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsPacked,
         .mBitsPerChannel = 32,
@@ -308,7 +313,7 @@ extern "C" void* PCPanelDriverEntry(CFAllocatorRef allocator, CFUUIDRef typeUUID
         deviceParams.Manufacturer = "PCPanel";
         deviceParams.DeviceUID = std::string("com.pcpanel.audio.device.") + std::to_string(i + 1);
         deviceParams.ModelUID = "com.pcpanel.audio.model";
-        deviceParams.SampleRate = 44100;
+        deviceParams.SampleRate = 48000;
         deviceParams.ChannelCount = 2;
         deviceParams.EnableMixing = true;
         deviceParams.Latency = 0;

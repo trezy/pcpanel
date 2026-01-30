@@ -3,7 +3,8 @@ import { Knob } from './components/Knob';
 import { Slider } from './components/Slider';
 import { Button } from './components/Button';
 import { Status } from './components/Status';
-import type { PCPanelAPI, DeviceState, ChannelActivityInfo } from './types';
+import { Toast } from './components/Toast';
+import type { PCPanelAPI, DeviceState, ChannelActivityInfo, ToastData } from './types';
 
 // Access the preload-exposed API
 const pcpanel = (window as unknown as { pcpanel: PCPanelAPI }).pcpanel;
@@ -15,6 +16,7 @@ export function App() {
   const [buttonStates, setButtonStates] = useState<boolean[]>(new Array(5).fill(false));
   const [outputDevice, setOutputDevice] = useState('Loading...');
   const [channelActivity, setChannelActivity] = useState<Record<number, ChannelActivityInfo>>({});
+  const [currentToast, setCurrentToast] = useState<ToastData | null>(null);
 
   const handleReconnect = useCallback(() => {
     setConnected(false);
@@ -43,6 +45,10 @@ export function App() {
       setChannelActivity({ ...activityInfo });
     });
 
+    pcpanel.onToast((toast) => {
+      setCurrentToast(toast);
+    });
+
     // Get initial state
     pcpanel.getDeviceState().then((state) => {
       if (state.connected) {
@@ -66,7 +72,13 @@ export function App() {
     return channelActivity[index] ?? { isActive: false, apps: [] };
   };
 
+  const dismissToast = useCallback(() => {
+    setCurrentToast(null);
+  }, []);
+
   return (
+    <>
+      <Toast toast={currentToast} onDismiss={dismissToast} />
     <div className="container">
       <header>
         <h1>PC Panel Pro</h1>
@@ -143,5 +155,6 @@ export function App() {
         </button>
       </footer>
     </div>
+    </>
   );
 }

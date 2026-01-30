@@ -34,3 +34,7 @@ driver/build/
 # Logs
 *.log
 npm-debug.log*
+
+# Release artifacts
+release/
+*.dmg

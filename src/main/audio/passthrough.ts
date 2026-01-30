@@ -2,11 +2,25 @@
 // Routes audio from PCPanel virtual devices to real output
 
 import * as path from 'path';
+import { app } from 'electron';
+
+/**
+ * Get the path to the native audio addon.
+ * Works in both development and packaged modes.
+ */
+function getNativeModulePath(): string {
+  if (app.isPackaged) {
+    // In packaged app, native modules are in Contents/Resources/native/
+    return path.join(process.resourcesPath, 'native', 'pcpanel_audio.node');
+  } else {
+    // In development, use the build output relative to compiled location (dist/main/audio/)
+    return path.join(__dirname, '../../../native/build/Release/pcpanel_audio.node');
+  }
+}
 
 // Load the native addon
-// When compiled, __dirname is dist/main/audio, so we need to go up to project root
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const audioAddon = require(path.join(__dirname, '../../../native/build/Release/pcpanel_audio.node'));
+const audioAddon = require(getNativeModulePath());
 
 interface AudioDevice {
   id: number;

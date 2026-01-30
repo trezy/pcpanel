@@ -16,6 +16,9 @@ contextBridge.exposeInMainWorld('pcpanel', {
   onChannelActivity: (callback: (activityInfo: Record<number, { isActive: boolean; apps: string[] }>) => void) => {
     ipcRenderer.on('channel-activity', (_event, info) => callback(info));
   },
+  onToast: (callback: (toast: { type: 'success' | 'warning' | 'error' | 'info'; message: string; duration?: number }) => void) => {
+    ipcRenderer.on('toast', (_event, toast) => callback(toast));
+  },
   getDeviceState: () => ipcRenderer.invoke('get-device-state'),
   getOutputDevice: () => ipcRenderer.invoke('get-output-device'),
   getChannelActivity: () => ipcRenderer.invoke('get-channel-activity') as Promise<Record<number, { isActive: boolean; apps: string[] }>>,
