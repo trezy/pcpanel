@@ -26,47 +26,81 @@ namespace {
 // Stores audio written to output for reading by input
 class LoopbackBuffer {
 public:
-    static constexpr size_t kBufferFrames = 48000; // 1 second at 48kHz
+    static constexpr size_t kBufferFrames = 48000 * 5; // 5 seconds at 48kHz (increased from 1s)
     static constexpr size_t kChannels = 2;
     static constexpr size_t kBufferSize = kBufferFrames * kChannels * sizeof(Float32);
 
-    LoopbackBuffer() : buffer_(kBufferSize, 0), writePos_(0), readPos_(0) {}
+    LoopbackBuffer() : buffer_(kBufferSize, 0), writePos_(0), readPos_(0), underrunCount_(0), logCounter_(0) {}
 
     void write(const void* data, size_t bytes) {
         const uint8_t* src = static_cast<const uint8_t*>(data);
-        size_t remaining = bytes;
+        size_t wp = writePos_.load(std::memory_order_relaxed);
+        size_t rp = readPos_.load(std::memory_order_acquire);
 
-        while (remaining > 0) {
-            size_t pos = writePos_.load(std::memory_order_relaxed) % kBufferSize;
-            size_t toWrite = std::min(remaining, kBufferSize - pos);
-
-            std::memcpy(buffer_.data() + pos, src, toWrite);
-
-            src += toWrite;
-            remaining -= toWrite;
-            writePos_.fetch_add(toWrite, std::memory_order_release);
+        // Calculate available space (using wrapped positions)
+        size_t used = wp - rp;  // This works due to unsigned wraparound
+        if (used > kBufferSize) {
+            // Read position is ahead - shouldn't happen but handle gracefully
+            used = 0;
         }
+        size_t space = kBufferSize - used;
+
+        size_t toWrite = std::min(bytes, space);
+        if (toWrite == 0) {
+            return;  // Buffer full
+        }
+
+        size_t writeIdx = wp % kBufferSize;
+        size_t firstChunk = std::min(toWrite, kBufferSize - writeIdx);
+
+        std::memcpy(buffer_.data() + writeIdx, src, firstChunk);
+        if (toWrite > firstChunk) {
+            std::memcpy(buffer_.data(), src + firstChunk, toWrite - firstChunk);
+        }
+
+        writePos_.store(wp + toWrite, std::memory_order_release);
     }
 
     size_t read(void* data, size_t bytes) {
         uint8_t* dst = static_cast<uint8_t*>(data);
-        size_t available = writePos_.load(std::memory_order_acquire) - readPos_.load(std::memory_order_relaxed);
+        size_t wp = writePos_.load(std::memory_order_acquire);
+        size_t rp = readPos_.load(std::memory_order_relaxed);
+
+        size_t available = wp - rp;  // Works with unsigned wraparound
+        if (available > kBufferSize) {
+            // Write wrapped around - reset to avoid stale data
+            available = 0;
+        }
+
         size_t toRead = std::min(bytes, available);
-        size_t totalRead = 0;
 
-        while (totalRead < toRead) {
-            size_t pos = readPos_.load(std::memory_order_relaxed) % kBufferSize;
-            size_t chunk = std::min(toRead - totalRead, kBufferSize - pos);
+        // Log periodically to diagnose timing issues
+        if (++logCounter_ % 500 == 0) {  // Every 500 reads (~10 seconds at typical callback rates)
+            size_t underruns = underrunCount_.load();
+            os_log(OS_LOG_DEFAULT, "PCPanel Loopback: available=%zu requested=%zu underruns=%zu",
+                   available, bytes, underruns);
+        }
 
-            std::memcpy(dst + totalRead, buffer_.data() + pos, chunk);
+        if (toRead > 0) {
+            size_t readIdx = rp % kBufferSize;
+            size_t firstChunk = std::min(toRead, kBufferSize - readIdx);
 
-            totalRead += chunk;
-            readPos_.fetch_add(chunk, std::memory_order_release);
+            std::memcpy(dst, buffer_.data() + readIdx, firstChunk);
+            if (toRead > firstChunk) {
+                std::memcpy(dst + firstChunk, buffer_.data(), toRead - firstChunk);
+            }
+
+            readPos_.store(rp + toRead, std::memory_order_release);
         }
 
         // Fill remaining with silence
-        if (totalRead < bytes) {
-            std::memset(dst + totalRead, 0, bytes - totalRead);
+        if (toRead < bytes) {
+            std::memset(dst + toRead, 0, bytes - toRead);
+            if (toRead == 0) {
+                underrunCount_.fetch_add(1);
+                os_log(OS_LOG_DEFAULT, "PCPanel Loopback UNDERRUN: requested=%zu available=%zu total_underruns=%zu",
+                       bytes, available, underrunCount_.load() + 1);
+            }
         }
 
         return toRead;
@@ -75,6 +109,7 @@ public:
     void clear() {
         writePos_.store(0, std::memory_order_relaxed);
         readPos_.store(0, std::memory_order_relaxed);
+        underrunCount_.store(0, std::memory_order_relaxed);
         // Zero out buffer to prevent stale audio playback
         std::memset(buffer_.data(), 0, buffer_.size());
     }
@@ -83,6 +118,8 @@ private:
     std::vector<uint8_t> buffer_;
     std::atomic<size_t> writePos_;
     std::atomic<size_t> readPos_;
+    std::atomic<size_t> underrunCount_;
+    mutable size_t logCounter_;
 };
 
 // I/O handler that implements loopback
@@ -341,10 +378,47 @@ extern "C" void* PCPanelDriverEntry(CFAllocatorRef allocator, CFUUIDRef typeUUID
         os_log(OS_LOG_DEFAULT, "PCPanel: Created device %s (index %d)", kDeviceNames[i], i);
     }
 
+    // Create Voice Chat virtual mic device (10th device)
+    // This device has both input and output streams:
+    // - Apps (like the PCPanel mixer) write to the output stream
+    // - Apps (like Discord) read from the input stream as a microphone
+    {
+        aspl::DeviceParameters vcParams;
+        vcParams.Name = "PCPanel Voice Chat";
+        vcParams.Manufacturer = "PCPanel";
+        vcParams.DeviceUID = "com.pcpanel.audio.voicechat";
+        vcParams.ModelUID = "com.pcpanel.audio.model";
+        vcParams.SampleRate = 48000;
+        vcParams.ChannelCount = 2;
+        vcParams.EnableMixing = true;
+        vcParams.Latency = 0;
+        vcParams.SafetyOffset = 0;
+
+        auto vcDevice = std::make_shared<PCPanelDevice>(context, vcParams, kNumDevices);
+
+        // Output stream (Voice Chat mixer writes to this)
+        aspl::StreamParameters vcOutputParams;
+        vcOutputParams.Direction = aspl::Direction::Output;
+        vcOutputParams.StartingChannel = 1;
+        vcOutputParams.Format = streamFormat;
+        vcDevice->AddStreamWithControlsAsync(vcOutputParams);
+
+        // Input stream with controls (apps like Discord read from this as microphone)
+        aspl::StreamParameters vcInputParams;
+        vcInputParams.Direction = aspl::Direction::Input;
+        vcInputParams.StartingChannel = 1;
+        vcInputParams.Format = streamFormat;
+        vcDevice->AddStreamWithControlsAsync(vcInputParams);
+
+        plugin->AddDevice(vcDevice);
+
+        os_log(OS_LOG_DEFAULT, "PCPanel: Created Voice Chat device (virtual mic)");
+    }
+
     // Create driver
     g_driver = std::make_shared<aspl::Driver>(context, plugin);
 
-    os_log(OS_LOG_DEFAULT, "PCPanel: Driver initialized with %d devices", kNumDevices);
+    os_log(OS_LOG_DEFAULT, "PCPanel: Driver initialized with %d channel devices + Voice Chat", kNumDevices);
 
     return g_driver->GetReference();
 }

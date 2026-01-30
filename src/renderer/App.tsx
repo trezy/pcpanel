@@ -4,7 +4,8 @@ import { Slider } from './components/Slider';
 import { Button } from './components/Button';
 import { Status } from './components/Status';
 import { Toast } from './components/Toast';
-import type { PCPanelAPI, DeviceState, ChannelActivityInfo, ToastData } from './types';
+import { VoiceChatMix } from './components/VoiceChatMix';
+import type { PCPanelAPI, DeviceState, AudioRoutingState, ToastData, AudioLevelInfo } from './types';
 
 // Access the preload-exposed API
 const pcpanel = (window as unknown as { pcpanel: PCPanelAPI }).pcpanel;
@@ -14,14 +15,45 @@ export function App() {
   const [statusMessage, setStatusMessage] = useState('Searching for device...');
   const [analogValues, setAnalogValues] = useState<number[]>(new Array(9).fill(0));
   const [buttonStates, setButtonStates] = useState<boolean[]>(new Array(5).fill(false));
-  const [outputDevice, setOutputDevice] = useState('Loading...');
-  const [channelActivity, setChannelActivity] = useState<Record<number, ChannelActivityInfo>>({});
+  const [routingState, setRoutingState] = useState<AudioRoutingState | null>(null);
+  const [audioLevels, setAudioLevels] = useState<Record<string, AudioLevelInfo>>({});
   const [currentToast, setCurrentToast] = useState<ToastData | null>(null);
 
   const handleReconnect = useCallback(() => {
     setConnected(false);
     setStatusMessage('Reconnecting...');
     pcpanel.reconnect();
+  }, []);
+
+  const handleLabelChange = useCallback(async (channelId: string, label: string) => {
+    try {
+      const newState = await pcpanel.setChannelLabel(channelId, label);
+      setRoutingState(newState);
+    } catch (err) {
+      console.error('Failed to update label:', err);
+    }
+  }, []);
+
+  const handleVoiceChatToggle = useCallback(async (channelId: string, enabled: boolean) => {
+    try {
+      await pcpanel.setChannelEnabled('voicechat', channelId, enabled);
+      // Refresh routing state
+      const newState = await pcpanel.getAudioRouting();
+      setRoutingState(newState);
+    } catch (err) {
+      console.error('Failed to toggle Voice Chat channel:', err);
+    }
+  }, []);
+
+  const handleOutputDeviceChange = useCallback(async (deviceId: number | null) => {
+    try {
+      await pcpanel.setMixOutput('personal', deviceId);
+      // Refresh routing state
+      const newState = await pcpanel.getAudioRouting();
+      setRoutingState(newState);
+    } catch (err) {
+      console.error('Failed to change output device:', err);
+    }
   }, []);
 
   useEffect(() => {
@@ -37,12 +69,23 @@ export function App() {
       setButtonStates([...state.buttonStates]);
     });
 
-    pcpanel.onOutputDevice((device) => {
-      setOutputDevice(device.name);
+    pcpanel.onChannelActivity((activityInfo) => {
+      // Update routing state with new activity info
+      setRoutingState(prev => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          channels: prev.channels.map(ch => ({
+            ...ch,
+            isActive: activityInfo[ch.hardwareIndex]?.isActive ?? false,
+            apps: activityInfo[ch.hardwareIndex]?.apps ?? [],
+          })),
+        };
+      });
     });
 
-    pcpanel.onChannelActivity((activityInfo) => {
-      setChannelActivity({ ...activityInfo });
+    pcpanel.onAudioLevels((levels) => {
+      setAudioLevels(levels);
     });
 
     pcpanel.onToast((toast) => {
@@ -59,18 +102,25 @@ export function App() {
       }
     });
 
-    pcpanel.getOutputDevice().then((device) => {
-      setOutputDevice(device?.name ?? 'Not available');
-    });
-
-    pcpanel.getChannelActivity().then((activityInfo) => {
-      setChannelActivity({ ...activityInfo });
+    // Get audio routing state
+    pcpanel.getAudioRouting().then((state) => {
+      console.log('Audio routing state:', state);
+      console.log('Channels:', state?.channels);
+      setRoutingState(state);
     });
   }, []);
 
-  const getActivityInfo = (index: number): { isActive: boolean; apps: string[] } => {
-    return channelActivity[index] ?? { isActive: false, apps: [] };
+  // Helper to get channel data by hardware index
+  const getChannelByIndex = (index: number) => {
+    return routingState?.channels.find(ch => ch.hardwareIndex === index);
   };
+
+  // Get selected output device ID
+  const selectedOutputId = (() => {
+    if (!routingState) return null;
+    const personalMix = routingState.mixBuses.find(m => m.id === 'personal');
+    return personalMix?.outputDeviceId ?? null;
+  })();
 
   const dismissToast = useCallback(() => {
     setCurrentToast(null);
@@ -89,7 +139,7 @@ export function App() {
         <section className="channels-section">
           <h2>Audio Channels</h2>
           <p className="section-hint">
-            Set your app's audio output to one of these devices in System Settings or the app's preferences.
+            Set your app's audio output to one of these devices. Click a channel name to rename it.
           </p>
 
           <div className="channels-grid">
@@ -97,14 +147,19 @@ export function App() {
               <h3>Knobs</h3>
               <div className="channel-row">
                 {[0, 1, 2, 3, 4].map((i) => {
-                  const activity = getActivityInfo(i);
+                  const channel = getChannelByIndex(i);
+                  const level = channel?.id ? audioLevels[channel.id] : undefined;
                   return (
                     <Knob
                       key={i}
                       index={i}
                       value={analogValues[i]}
-                      isPlaying={activity.isActive}
-                      apps={activity.apps}
+                      isPlaying={channel?.isActive ?? false}
+                      apps={channel?.apps ?? []}
+                      channelId={channel?.id}
+                      channelName={channel?.channelName}
+                      onLabelChange={handleLabelChange}
+                      level={level}
                     />
                   );
                 })}
@@ -115,14 +170,19 @@ export function App() {
               <h3>Sliders</h3>
               <div className="channel-row">
                 {[5, 6, 7, 8].map((i) => {
-                  const activity = getActivityInfo(i);
+                  const channel = getChannelByIndex(i);
+                  const level = channel?.id ? audioLevels[channel.id] : undefined;
                   return (
                     <Slider
                       key={i}
                       index={i}
                       value={analogValues[i]}
-                      isPlaying={activity.isActive}
-                      apps={activity.apps}
+                      isPlaying={channel?.isActive ?? false}
+                      apps={channel?.apps ?? []}
+                      channelId={channel?.id}
+                      channelName={channel?.channelName}
+                      onLabelChange={handleLabelChange}
+                      level={level}
                     />
                   );
                 })}
@@ -143,10 +203,33 @@ export function App() {
         <section className="output-section">
           <h2>Output Device</h2>
           <div className="output-info">
-            <span id="output-device-name">{outputDevice}</span>
-            <span className="output-hint">All audio routes to your default output</span>
+            <select
+              className="output-device-select"
+              value={selectedOutputId ?? ''}
+              onChange={(e) => {
+                const value = e.target.value;
+                handleOutputDeviceChange(value === '' ? null : Number(value));
+              }}
+              disabled={!routingState}
+            >
+              <option value="">System Default</option>
+              {routingState?.availableOutputs.map(device => (
+                <option key={device.id} value={device.id}>
+                  {device.name}{device.isDefault ? ' (Default)' : ''}
+                </option>
+              ))}
+            </select>
+            <span className="output-hint">Select where mixed audio should be sent</span>
           </div>
         </section>
+
+        {routingState && (
+          <VoiceChatMix
+            channels={routingState.channels}
+            mixBus={routingState.mixBuses.find(m => m.id === 'voicechat')}
+            onToggleChannel={handleVoiceChatToggle}
+          />
+        )}
       </main>
 
       <footer>

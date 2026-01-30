@@ -1,15 +1,37 @@
 import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, dialog } from 'electron';
 import * as path from 'path';
 import { scanForDevices, PCPanelConnection, DeviceState, DeviceEvent } from './hid';
-import { audioPassthrough } from './audio/passthrough';
+import { audioRouting } from './audio/routing';
+import { CHANNEL_DEFINITIONS } from './audio/types';
 import { isDriverInstalled, promptAndInstallDriver, showDriverNotInstalledWarning, isFirstLaunch, markFirstLaunchComplete } from './driver/installer';
 
 let mainWindow: BrowserWindow | null = null;
 let connection: PCPanelConnection | null = null;
 let scanInterval: NodeJS.Timeout | null = null;
 let activityInterval: NodeJS.Timeout | null = null;
+let levelsInterval: NodeJS.Timeout | null = null;
 let tray: Tray | null = null;
 let isQuitting = false;
+
+// Request single instance lock
+const gotTheLock = app.requestSingleInstanceLock();
+
+if (!gotTheLock) {
+  // Another instance is already running - quit immediately
+  app.quit();
+} else {
+  // This is the primary instance - handle second-instance event
+  app.on('second-instance', () => {
+    // Someone tried to run a second instance, focus our window instead
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) {
+        mainWindow.restore();
+      }
+      mainWindow.show();
+      mainWindow.focus();
+    }
+  });
+}
 
 // Safe logging that won't crash on EPIPE
 function log(...args: unknown[]): void {
@@ -139,6 +161,11 @@ function sendToRenderer(channel: string, data: unknown): void {
 }
 
 async function connectToDevice(): Promise<void> {
+  // If already connected, don't try again
+  if (connection?.isConnected()) {
+    return;
+  }
+
   const devices = await scanForDevices();
 
   if (devices.length === 0) {
@@ -161,8 +188,11 @@ async function connectToDevice(): Promise<void> {
     });
   }
 
+  // Close any existing connection first and give OS time to release device
   if (connection) {
     connection.disconnect();
+    connection = null;
+    await new Promise(resolve => setTimeout(resolve, 100));
   }
 
   connection = new PCPanelConnection();
@@ -190,12 +220,12 @@ async function connectToDevice(): Promise<void> {
 
     // Update volume when knob or slider changes
     if (event.type === 'knob-change') {
-      audioPassthrough.setVolumeFromHardware(event.index, event.value);
+      audioRouting.handleHardwareChange(event.index, event.value);
     } else if (event.type === 'state-response') {
       // Apply all initial volume values from device state
       log('Received device state, applying initial volumes');
       for (let i = 0; i < event.analogValues.length; i++) {
-        audioPassthrough.setVolumeFromHardware(i, event.analogValues[i]);
+        audioRouting.handleHardwareChange(i, event.analogValues[i]);
       }
     }
   });
@@ -290,24 +320,23 @@ app.whenReady().then(async () => {
 
   startDeviceScanning();
 
-  // Start audio passthrough for available PCPanel devices
+  // Start audio routing (BEACN-style mixer)
   setTimeout(() => {
-    log('Starting audio passthrough...');
-    const devices = audioPassthrough.findPCPanelDevices();
-    log('Found PCPanel audio devices:', devices.map(d => d.name));
+    log('Starting audio routing...');
+    audioRouting.initialize();
+    log('Audio routing started');
 
-    if (devices.length > 0) {
-      audioPassthrough.startAll();
-      log('Audio passthrough started');
+    // Start polling for channel activity
+    activityInterval = setInterval(() => {
+      const activityInfo = audioRouting.getChannelActivityInfo();
+      sendToRenderer('channel-activity', activityInfo);
+    }, 500); // Poll every 500ms
 
-      // Start polling for channel activity
-      activityInterval = setInterval(() => {
-        const activityInfo = audioPassthrough.getChannelActivityInfo();
-        sendToRenderer('channel-activity', activityInfo);
-      }, 500); // Poll every 500ms
-    } else {
-      log('No PCPanel audio devices found - driver may not be loaded');
-    }
+    // Start polling for audio levels (faster for smooth meters)
+    levelsInterval = setInterval(() => {
+      const levels = audioRouting.getAudioLevels();
+      sendToRenderer('audio-levels', levels);
+    }, 50); // Poll every 50ms for smooth metering
   }, 2000); // Wait for driver to be ready
 
   app.on('activate', () => {
@@ -317,9 +346,15 @@ app.whenReady().then(async () => {
   });
 });
 
-// Handle app quit
-app.on('before-quit', () => {
-  isQuitting = true;
+// Handle app quit - intercept Cmd+Q to hide to tray instead of quitting
+app.on('before-quit', (event) => {
+  // If not intentionally quitting (e.g., from tray menu), hide to tray instead
+  if (!isQuitting) {
+    event.preventDefault();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.hide();
+    }
+  }
 });
 
 app.on('window-all-closed', () => {
@@ -340,12 +375,16 @@ function cleanup(): void {
     clearInterval(activityInterval);
     activityInterval = null;
   }
+  if (levelsInterval) {
+    clearInterval(levelsInterval);
+    levelsInterval = null;
+  }
   if (connection) {
     connection.disconnect();
     connection = null;
   }
-  // Stop all audio passthrough
-  audioPassthrough.stopAll();
+  // Stop all audio routing
+  audioRouting.shutdown();
 
   if (tray) {
     tray.destroy();
@@ -371,9 +410,52 @@ ipcMain.handle('reconnect-device', async () => {
 });
 
 ipcMain.handle('get-output-device', () => {
-  return audioPassthrough.getDefaultOutput();
+  const state = audioRouting.getState();
+  const personalMix = state.mixBuses.find(m => m.id === 'personal');
+  if (personalMix && personalMix.outputDeviceId !== null) {
+    const output = state.availableOutputs.find(o => o.id === personalMix.outputDeviceId);
+    if (output) return output;
+  }
+  // Return default output
+  return state.availableOutputs.find(o => o.isDefault) || state.availableOutputs[0] || null;
 });
 
 ipcMain.handle('get-channel-activity', () => {
-  return audioPassthrough.getChannelActivityInfo();
+  return audioRouting.getChannelActivityInfo();
+});
+
+// Audio routing IPC handlers
+ipcMain.handle('get-audio-routing', () => {
+  const state = audioRouting.getState();
+  log('get-audio-routing IPC called, returning:', JSON.stringify(state.channels.map(c => ({ id: c.id, hardwareIndex: c.hardwareIndex }))));
+  return state;
+});
+
+ipcMain.handle('set-channel-label', (_event, channelId: string, label: string) => {
+  audioRouting.setChannelLabel(channelId, label);
+  return audioRouting.getState();
+});
+
+ipcMain.handle('set-channel-volume', (_event, channelId: string, volume: number) => {
+  audioRouting.setChannelVolume(channelId, volume);
+  return true;
+});
+
+ipcMain.handle('set-channel-muted', (_event, channelId: string, muted: boolean) => {
+  audioRouting.setChannelMuted(channelId, muted);
+  return true;
+});
+
+ipcMain.handle('set-channel-enabled-in-mix', (_event, mixId: string, channelId: string, enabled: boolean) => {
+  audioRouting.setChannelEnabledInMix(mixId, channelId, enabled);
+  return true;
+});
+
+ipcMain.handle('set-mix-output', (_event, mixId: string, deviceId: number | null) => {
+  audioRouting.setMixOutput(mixId, deviceId);
+  return true;
+});
+
+ipcMain.handle('get-available-outputs', () => {
+  return audioRouting.getAvailableOutputDevices();
 });

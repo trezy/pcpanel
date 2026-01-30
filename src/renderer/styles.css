@@ -182,9 +182,112 @@ h3 {
   color: #6366f1;
 }
 
-.channel-label {
+.channel-name.editable {
+  cursor: pointer;
+  border-bottom: 1px dashed transparent;
+  transition: all 0.2s;
+  padding: 4px 8px;
+  margin: -4px -8px;
+  display: inline-block;
+  user-select: none;
+  border-radius: 4px;
+}
+
+.channel-name.editable:hover {
+  border-bottom-color: #6366f1;
+  background: rgba(99, 102, 241, 0.15);
+}
+
+.hardware-name {
   font-size: 11px;
   color: #666;
+}
+
+/* Channel name editor modal */
+.channel-name-editor-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.channel-name-editor {
+  background: #1a1a2e;
+  border: 1px solid #333;
+  border-radius: 8px;
+  padding: 20px;
+  min-width: 280px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+.channel-name-editor label {
+  display: block;
+  font-size: 14px;
+  font-weight: 600;
+  color: #fff;
+  margin-bottom: 12px;
+}
+
+.channel-name-editor input {
+  width: 100%;
+  font-size: 14px;
+  color: #fff;
+  background: #2a2a4e;
+  border: 1px solid #444;
+  border-radius: 6px;
+  padding: 10px 12px;
+  outline: none;
+  box-sizing: border-box;
+}
+
+.channel-name-editor input:focus {
+  border-color: #6366f1;
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.3);
+}
+
+.channel-name-editor-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.channel-name-editor-actions button {
+  padding: 8px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.channel-name-editor-actions button:not(.primary) {
+  background: transparent;
+  border: 1px solid #444;
+  color: #aaa;
+}
+
+.channel-name-editor-actions button:not(.primary):hover {
+  background: #2a2a4e;
+  border-color: #555;
+  color: #fff;
+}
+
+.channel-name-editor-actions button.primary {
+  background: #6366f1;
+  border: 1px solid #6366f1;
+  color: #fff;
+}
+
+.channel-name-editor-actions button.primary:hover {
+  background: #5558e3;
+  border-color: #5558e3;
 }
 
 .control-value {
@@ -196,7 +299,47 @@ h3 {
   color: #aaa;
 }
 
+/* Level Meters */
+.level-meter {
+  width: 8px;
+  height: 100px;
+  background: #1a1a2e;
+  border-radius: 4px;
+  overflow: hidden;
+  position: relative;
+  margin-right: 8px;
+}
+
+.knob .level-meter {
+  height: 50px;
+  margin-right: 6px;
+}
+
+.level-fill {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: linear-gradient(to top, #4caf50, #8bc34a 70%, #ffeb3b 85%, #f44336 95%);
+  transition: height 0.05s ease-out;
+  border-radius: 0 0 4px 4px;
+}
+
+.level-peak {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: #fff;
+  transition: bottom 0.05s ease-out, opacity 0.5s ease-out;
+}
+
 /* Sliders */
+.slider .channel-control {
+  display: flex;
+  align-items: flex-end;
+}
+
 .slider .control-bar {
   width: 36px;
   height: 100px;
@@ -217,6 +360,10 @@ h3 {
 }
 
 /* Knobs */
+.knob .channel-control {
+  display: flex;
+  align-items: center;
+}
 .knob-visual {
   width: 50px;
   height: 50px;
@@ -286,13 +433,47 @@ h3 {
 .output-info {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 8px;
 }
 
-#output-device-name {
-  font-size: 16px;
-  font-weight: 600;
+.output-device-select {
+  width: 100%;
+  max-width: 400px;
+  padding: 10px 14px;
+  font-size: 14px;
+  font-weight: 500;
   color: #eee;
+  background: #2a2a4a;
+  border: 1px solid #3a3a5a;
+  border-radius: 8px;
+  cursor: pointer;
+  outline: none;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23888' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  padding-right: 36px;
+}
+
+.output-device-select:hover {
+  border-color: #4a4a6a;
+  background-color: #32325a;
+}
+
+.output-device-select:focus {
+  border-color: #6366f1;
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.3);
+}
+
+.output-device-select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.output-device-select option {
+  background: #1a1a2e;
+  color: #eee;
+  padding: 8px;
 }
 
 .output-hint {
@@ -393,6 +574,126 @@ footer {
 
 .toast-info .toast-icon {
   color: #90caf9;
+}
+
+/* Voice Chat Mix Section */
+.voice-chat-section {
+  margin-bottom: 30px;
+  padding: 20px;
+  background: #22223a;
+  border-radius: 12px;
+}
+
+.voice-chat-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+  padding: 8px 12px;
+  background: #1a1a2e;
+  border-radius: 6px;
+  width: fit-content;
+}
+
+.voice-chat-status .status-indicator {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #666;
+}
+
+.voice-chat-status .status-indicator.active {
+  background: #4caf50;
+  box-shadow: 0 0 6px #4caf50;
+}
+
+.voice-chat-status .status-text {
+  font-size: 12px;
+  color: #888;
+}
+
+.voice-chat-channels {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 10px;
+}
+
+.voice-chat-channel {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  background: #2a2a4a;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.voice-chat-channel:hover {
+  background: #32325a;
+}
+
+.voice-chat-channel input[type="checkbox"] {
+  display: none;
+}
+
+.voice-chat-channel .channel-toggle {
+  width: 20px;
+  height: 20px;
+  border: 2px solid #555;
+  border-radius: 4px;
+  background: transparent;
+  transition: all 0.2s;
+  position: relative;
+  flex-shrink: 0;
+}
+
+.voice-chat-channel input[type="checkbox"]:checked + .channel-toggle {
+  background: #6366f1;
+  border-color: #6366f1;
+}
+
+.voice-chat-channel input[type="checkbox"]:checked + .channel-toggle::after {
+  content: '';
+  position: absolute;
+  left: 5px;
+  top: 2px;
+  width: 5px;
+  height: 10px;
+  border: solid #fff;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+.voice-chat-channel .channel-details {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.voice-chat-channel .channel-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: #eee;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.voice-chat-channel .hardware-name {
+  font-size: 11px;
+  color: #666;
+}
+
+.voice-chat-channel .active-indicator {
+  font-size: 10px;
+  color: #4caf50;
+  background: rgba(76, 175, 80, 0.2);
+  padding: 2px 6px;
+  border-radius: 4px;
+  flex-shrink: 0;
 }
 
 /* Responsive */
